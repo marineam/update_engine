@@ -16,6 +16,7 @@
 #include "update_engine/payload_signer.h"
 #include "update_engine/prefs_interface.h"
 #include "update_engine/terminator.h"
+#include "update_engine/utils.h"
 
 using std::string;
 using std::vector;
@@ -52,8 +53,43 @@ void LogPartitionInfo(const DeltaArchiveManifest& manifest) {
 
 }  // namespace {}
 
+PayloadProcessor::PayloadProcessor(PrefsInterface* prefs, InstallPlan* install_plan)
+  : partition_performer_(prefs, install_plan->install_path),
+    kernel_performer_(prefs, install_plan->kernel_path),
+    prefs_(prefs),
+    install_plan_(install_plan),
+    manifest_valid_(false),
+    manifest_metadata_size_(0),
+    next_operation_num_(0),
+    buffer_offset_(0),
+    last_updated_buffer_offset_(std::numeric_limits<uint64_t>::max()),
+    public_key_path_(kUpdatePayloadPublicKeyPath),
+    num_total_operations_(0) {
+}
+
+int PayloadProcessor::Open() {
+  int err = partition_performer_.Open();
+  if (err != 0) {
+    return err;
+  }
+  if (!install_plan_->kernel_path.empty()) {
+    err = kernel_performer_.Open();
+    if (err != 0) {
+      partition_performer_.Close();
+      return err;
+    }
+  }
+  return 0;
+}
+
 int PayloadProcessor::Close() {
-  int err = delta_performer_.Close();
+  int err = partition_performer_.Close();
+  if (!install_plan_->kernel_path.empty()) {
+    int err2 = kernel_performer_.Close();
+    if (err == 0) {
+      err = err2;
+    }
+  }
   LOG_IF(ERROR, !hash_calculator_.Finalize()) << "Unable to finalize the hash.";
   if (!buffer_.empty()) {
     LOG(ERROR) << "Called Close() while buffer not empty!";
@@ -135,6 +171,10 @@ ActionExitCode PayloadProcessor::LoadManifest() {
   }
 
   num_total_operations_ = manifest_.partition_operations_size();
+  for (const InstallBlob &blob : manifest_.blobs()) {
+    num_total_operations_ += blob.operations_size();
+  }
+
   if (next_operation_num_ > 0)
     LOG(INFO) << "Resuming after " << next_operation_num_ << " operations";
   LOG(INFO) << "Starting to apply update payload operations";
@@ -145,32 +185,60 @@ ActionExitCode PayloadProcessor::LoadManifest() {
 ActionExitCode PayloadProcessor::PerformOperation() {
   DCHECK(next_operation_num_ < num_total_operations_);
 
-  const InstallOperation &op =
-      manifest_.partition_operations(next_operation_num_);
+  const size_t total_partition_operations = manifest_.partition_operations_size();
+  const InstallOperation *op = nullptr;
+  DeltaPerformer *performer = nullptr;
 
-  if (op.data_length() && op.data_offset() != buffer_offset_) {
+  if (next_operation_num_ < total_partition_operations) {
+    op = &manifest_.partition_operations(next_operation_num_);
+    performer = &partition_performer_;
+  } else {
+    size_t next_operation_index = next_operation_num_ - total_partition_operations;
+
+    for (const InstallBlob &blob : manifest_.blobs()) {
+      const size_t total_blob_operations = blob.operations_size();
+      if (next_operation_index < total_blob_operations) {
+        op = &blob.operations(next_operation_index);
+        if (blob.type() == blob.KERNEL) {
+          if (!install_plan_->kernel_path.empty()) {
+            LOG(ERROR) << "Payload includes unexpected kernel!";
+            return kActionCodeDownloadOperationExecutionError;
+          }
+          performer = &kernel_performer_;
+        } else {
+          DCHECK(false);
+        }
+      } else {
+        next_operation_index -= total_blob_operations;
+      }
+    }
+  }
+
+  DCHECK(op && performer);
+
+  if (op->data_length() && op->data_offset() != buffer_offset_) {
     LOG(ERROR) << "Operation " << next_operation_num_
-               << " skipped to unexpected data offset " << op.data_offset()
+               << " skipped to unexpected data offset " << op->data_offset()
                << ", expected " << buffer_offset_;
     return kActionCodeDownloadOperationExecutionError;
   }
 
-  if (op.data_length() > buffer_.size())
+  if (op->data_length() > buffer_.size())
     return kActionCodeDownloadIncomplete;
 
   // Makes sure we unblock exit when this operation completes.
   ScopedTerminatorExitUnblocker exit_unblocker =
       ScopedTerminatorExitUnblocker();  // Avoids a compiler unused var bug.
 
-  ActionExitCode error = delta_performer_.PerformOperation(op, buffer_);
+  ActionExitCode error = performer->PerformOperation(*op, buffer_);
   if (error != kActionCodeSuccess) {
     LOG(ERROR) << "Aborting install procedure at operation "
                << next_operation_num_;
     return error;
   }
 
-  buffer_offset_ += op.data_length();
-  DiscardBufferHeadBytes(op.data_length());
+  buffer_offset_ += op->data_length();
+  DiscardBufferHeadBytes(op->data_length());
   next_operation_num_++;
 
   LOG(INFO) << "Completed " << next_operation_num_ << "/"
@@ -410,7 +478,8 @@ bool PayloadProcessor::CheckpointUpdateProgress() {
 
 bool PayloadProcessor::PrimeUpdateState() {
   CHECK(manifest_valid_);
-  delta_performer_.SetBlockSize(manifest_.block_size());
+  partition_performer_.SetBlockSize(manifest_.block_size());
+  kernel_performer_.SetBlockSize(manifest_.block_size());
 
   int64_t next_operation = kUpdateStateOperationInvalid;
   if (!prefs_->GetInt64(kPrefsUpdateStateNextOperation, &next_operation) ||

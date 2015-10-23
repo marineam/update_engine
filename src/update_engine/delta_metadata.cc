@@ -54,6 +54,16 @@ ActionExitCode DeltaMetadata::ParsePayload(
     LOG(ERROR) << "Unable to parse manifest in update file.";
     return kActionCodeDownloadManifestParseError;
   }
+
+  for (const InstallBlob &blob : manifest->blobs()) {
+    // TODO(marineam): figure out if it is possible for this to fail,
+    // does the parsing step fail instead? I cannot tell... :(
+    if (!blob.Type_IsValid(blob.type())) {
+      LOG(ERROR) << "Unknown InstallBlob Type value: " << blob.type();
+      return kActionCodeDownloadManifestParseError;
+    }
+  }
+
   return kActionCodeSuccess;
 }
 
