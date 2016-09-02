@@ -10,6 +10,8 @@
 #include "update_engine/action_mock.h"
 #include "update_engine/action_processor_mock.h"
 #include "update_engine/filesystem_copier_action.h"
+#include "update_engine/kernel_copier_action.h"
+#include "update_engine/kernel_verifier_action.h"
 #include "update_engine/mock_dbus_interface.h"
 #include "update_engine/mock_http_fetcher.h"
 #include "update_engine/mock_payload_state.h"
@@ -305,10 +307,12 @@ const string kActionTypes[] = {
   OmahaRequestAction::StaticType(),
   OmahaResponseHandlerAction::StaticType(),
   FilesystemCopierAction::StaticType(),
+  KernelCopierAction::StaticType(),
   OmahaRequestAction::StaticType(),
   DownloadAction::StaticType(),
   OmahaRequestAction::StaticType(),
   FilesystemCopierAction::StaticType(),
+  KernelVerifierAction::StaticType(),
   PostinstallRunnerAction::StaticType(),
   OmahaRequestAction::StaticType()
 };
@@ -338,7 +342,7 @@ void UpdateAttempterTest::UpdateTestVerify() {
   EXPECT_EQ(attempter_.response_handler_action_.get(),
             attempter_.actions_[1].get());
   DownloadAction* download_action =
-      dynamic_cast<DownloadAction*>(attempter_.actions_[4].get());
+      dynamic_cast<DownloadAction*>(attempter_.actions_[5].get());
   ASSERT_TRUE(download_action != NULL);
   EXPECT_EQ(&attempter_, download_action->delegate());
   EXPECT_EQ(UPDATE_STATUS_CHECKING_FOR_UPDATE, attempter_.status());
